@@ -1,0 +1,234 @@
+# 1-CU / 7-DU topology -- GENERATED, do not hand-edit.
+# Derived from the 1cu10du compose files by keeping only du0-du6 / ue0-ue6.
+# The DU and UE configs are the SAME *_1cu10du_{0..6} files: they already
+# carry gnb_id 511, cu_cp_addr 175.53.1.11 and PCIs 1-7 with unique
+# sector_ids, so nothing about them needs to change for a 7-DU stack.
+# Container names stay srscu0 / srsdu0-6 / srsue0-6 so every Prometheus
+# query and the 874-column schema keep working.
+services:
+  du0:
+    container_name: srsdu0
+    image: srsran:split_8_zmq
+    stdin_open: true
+    tty: true
+    privileged: true
+    cap_add:
+    - SYS_NICE
+    - CAP_SYS_PTRACE
+    - NET_ADMIN
+    volumes:
+    - /dev/bus/usb/:/dev/bus/usb/
+    - /usr/share/uhd/images:/usr/share/uhd/images
+    - ./RAN/du_1cu10du_0.conf:/config/du.conf
+    - ./RAN/du_entrypoint.sh:/tmp/entrypoint.sh
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.1.10
+      telemetry-net:
+        ipv4_address: 171.53.1.10
+    command: bash -c 'chmod +x /tmp/entrypoint.sh && /tmp/entrypoint.sh && srsdu -c /config/du.conf'
+    deploy:
+      resources:
+        limits:
+          cpus: '3.0'
+          memory: 3G
+        reservations:
+          cpus: '3.0'
+          memory: 3G
+  du1:
+    container_name: srsdu1
+    image: srsran:split_8_zmq
+    stdin_open: true
+    tty: true
+    privileged: true
+    cap_add:
+    - SYS_NICE
+    - CAP_SYS_PTRACE
+    - NET_ADMIN
+    volumes:
+    - /dev/bus/usb/:/dev/bus/usb/
+    - /usr/share/uhd/images:/usr/share/uhd/images
+    - ./RAN/du_1cu10du_1.conf:/config/du.conf
+    - ./RAN/du_entrypoint.sh:/tmp/entrypoint.sh
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.1.13
+      telemetry-net:
+        ipv4_address: 171.53.1.13
+    command: bash -c 'chmod +x /tmp/entrypoint.sh && /tmp/entrypoint.sh && srsdu -c /config/du.conf'
+    deploy:
+      resources:
+        limits:
+          cpus: '3.0'
+          memory: 3G
+        reservations:
+          cpus: '3.0'
+          memory: 3G
+  du2:
+    container_name: srsdu2
+    image: srsran:split_8_zmq
+    stdin_open: true
+    tty: true
+    privileged: true
+    cap_add:
+    - SYS_NICE
+    - CAP_SYS_PTRACE
+    - NET_ADMIN
+    volumes:
+    - /dev/bus/usb/:/dev/bus/usb/
+    - /usr/share/uhd/images:/usr/share/uhd/images
+    - ./RAN/du_1cu10du_2.conf:/config/du.conf
+    - ./RAN/du_entrypoint.sh:/tmp/entrypoint.sh
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.1.14
+      telemetry-net:
+        ipv4_address: 171.53.1.14
+    command: bash -c 'chmod +x /tmp/entrypoint.sh && /tmp/entrypoint.sh && srsdu -c /config/du.conf'
+    deploy:
+      resources:
+        limits:
+          cpus: '3.0'
+          memory: 3G
+        reservations:
+          cpus: '3.0'
+          memory: 3G
+  du3:
+    container_name: srsdu3
+    image: srsran:split_8_zmq
+    stdin_open: true
+    tty: true
+    privileged: true
+    cap_add:
+    - SYS_NICE
+    - CAP_SYS_PTRACE
+    - NET_ADMIN
+    volumes:
+    - /dev/bus/usb/:/dev/bus/usb/
+    - /usr/share/uhd/images:/usr/share/uhd/images
+    - ./RAN/du_1cu10du_3.conf:/config/du.conf
+    - ./RAN/du_entrypoint.sh:/tmp/entrypoint.sh
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.1.16
+      telemetry-net:
+        ipv4_address: 171.53.1.16
+    command: bash -c 'chmod +x /tmp/entrypoint.sh && /tmp/entrypoint.sh && srsdu -c /config/du.conf'
+    deploy:
+      resources:
+        limits:
+          cpus: '3.0'
+          memory: 3G
+        reservations:
+          cpus: '3.0'
+          memory: 3G
+  du4:
+    container_name: srsdu4
+    image: srsran:split_8_zmq
+    stdin_open: true
+    tty: true
+    privileged: true
+    cap_add:
+    - SYS_NICE
+    - CAP_SYS_PTRACE
+    - NET_ADMIN
+    volumes:
+    - /dev/bus/usb/:/dev/bus/usb/
+    - /usr/share/uhd/images:/usr/share/uhd/images
+    - ./RAN/du_1cu10du_4.conf:/config/du.conf
+    - ./RAN/du_entrypoint.sh:/tmp/entrypoint.sh
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.1.17
+      telemetry-net:
+        ipv4_address: 171.53.1.17
+    command: bash -c 'chmod +x /tmp/entrypoint.sh && /tmp/entrypoint.sh && srsdu -c /config/du.conf'
+    deploy:
+      resources:
+        limits:
+          cpus: '3.0'
+          memory: 3G
+        reservations:
+          cpus: '3.0'
+          memory: 3G
+  du5:
+    container_name: srsdu5
+    image: srsran:split_8_zmq
+    stdin_open: true
+    tty: true
+    privileged: true
+    cap_add:
+    - SYS_NICE
+    - CAP_SYS_PTRACE
+    - NET_ADMIN
+    volumes:
+    - /dev/bus/usb/:/dev/bus/usb/
+    - /usr/share/uhd/images:/usr/share/uhd/images
+    - ./RAN/du_1cu10du_5.conf:/config/du.conf
+    - ./RAN/du_entrypoint.sh:/tmp/entrypoint.sh
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.1.18
+      telemetry-net:
+        ipv4_address: 171.53.1.18
+    command: bash -c 'chmod +x /tmp/entrypoint.sh && /tmp/entrypoint.sh && srsdu -c /config/du.conf'
+    deploy:
+      resources:
+        limits:
+          cpus: '3.0'
+          memory: 3G
+        reservations:
+          cpus: '3.0'
+          memory: 3G
+  du6:
+    container_name: srsdu6
+    image: srsran:split_8_zmq
+    stdin_open: true
+    tty: true
+    privileged: true
+    cap_add:
+    - SYS_NICE
+    - CAP_SYS_PTRACE
+    - NET_ADMIN
+    volumes:
+    - /dev/bus/usb/:/dev/bus/usb/
+    - /usr/share/uhd/images:/usr/share/uhd/images
+    - ./RAN/du_1cu10du_6.conf:/config/du.conf
+    - ./RAN/du_entrypoint.sh:/tmp/entrypoint.sh
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.1.28
+      telemetry-net:
+        ipv4_address: 171.53.1.28
+    command: bash -c 'chmod +x /tmp/entrypoint.sh && /tmp/entrypoint.sh && srsdu -c /config/du.conf'
+    deploy:
+      resources:
+        limits:
+          cpus: '3.0'
+          memory: 3G
+        reservations:
+          cpus: '3.0'
+          memory: 3G
+  redis:
+    image: redis:latest
+    container_name: redis
+    ports:
+    - 6379:6379
+    networks:
+      oran-intel:
+        ipv4_address: 175.24.0.1
+volumes:
+  gnb-storage: null
+  grafana-storage: null
+  influxdb-storage: null
+  prometheus-storage:
+    driver: local
+    driver_opts:
+      type: none
+      device: ./setup/prometheus/
+      o: bind
+networks:
+  oran-intel:
+    external: true
+  telemetry-net:
+    external: true

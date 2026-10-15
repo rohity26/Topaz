@@ -1,0 +1,244 @@
+# 1-CU / 7-DU topology -- GENERATED, do not hand-edit.
+# Derived from the 1cu10du compose files by keeping only du0-du6 / ue0-ue6.
+# The DU and UE configs are the SAME *_1cu10du_{0..6} files: they already
+# carry gnb_id 511, cu_cp_addr 175.53.1.11 and PCIs 1-7 with unique
+# sector_ids, so nothing about them needs to change for a 7-DU stack.
+# Container names stay srscu0 / srsdu0-6 / srsue0-6 so every Prometheus
+# query and the 874-column schema keep working.
+services:
+  ue0:
+    container_name: srsue0
+    image: srsue:split_8_zmq
+    user: root
+    build:
+      context: UE
+      dockerfile: Dockerfile
+      args:
+        OS_VERSION: '22.04'
+    devices:
+    - /dev/net/tun
+    cap_add:
+    - SYS_NICE
+    - SYS_RESOURCE
+    - NET_ADMIN
+    - CAP_IPC_LOCK
+    env_file:
+    - .env
+    volumes:
+    - ./UE/ue_1cu10du_0.conf:/configs/ue.conf
+    - /dev/null:/tmp/ue.log
+    environment:
+    - LD_LIBRARY_PATH=/srsue_4G/lib/src/phy/rf/
+    - PING=${PING}
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.2.1
+    command: bash -c '/srsue_4G/srsue/src/srsue /configs/ue.conf'
+  ue1:
+    container_name: srsue1
+    image: srsue:split_8_zmq
+    user: root
+    devices:
+    - /dev/net/tun
+    cap_add:
+    - SYS_NICE
+    - SYS_RESOURCE
+    - NET_ADMIN
+    - CAP_IPC_LOCK
+    env_file:
+    - .env
+    volumes:
+    - ./UE/ue_1cu10du_1.conf:/configs/ue.conf
+    - /dev/null:/tmp/ue.log
+    environment:
+    - LD_LIBRARY_PATH=/srsue_4G/lib/src/phy/rf/
+    - PING=${PING}
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.3.1
+    command: bash -c '/srsue_4G/srsue/src/srsue /configs/ue.conf'
+  ue2:
+    container_name: srsue2
+    image: srsue:split_8_zmq
+    user: root
+    devices:
+    - /dev/net/tun
+    cap_add:
+    - SYS_NICE
+    - SYS_RESOURCE
+    - NET_ADMIN
+    - CAP_IPC_LOCK
+    env_file:
+    - .env
+    volumes:
+    - ./UE/ue_1cu10du_2.conf:/configs/ue.conf
+    - /dev/null:/tmp/ue.log
+    environment:
+    - LD_LIBRARY_PATH=/srsue_4G/lib/src/phy/rf/
+    - PING=${PING}
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.4.1
+    command: bash -c '/srsue_4G/srsue/src/srsue /configs/ue.conf'
+  ue3:
+    container_name: srsue3
+    image: srsue:split_8_zmq
+    user: root
+    devices:
+    - /dev/net/tun
+    cap_add:
+    - SYS_NICE
+    - SYS_RESOURCE
+    - NET_ADMIN
+    - CAP_IPC_LOCK
+    env_file:
+    - .env
+    volumes:
+    - ./UE/ue_1cu10du_3.conf:/configs/ue.conf
+    - /dev/null:/tmp/ue.log
+    environment:
+    - LD_LIBRARY_PATH=/srsue_4G/lib/src/phy/rf/
+    - PING=${PING}
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.5.1
+    command: bash -c '/srsue_4G/srsue/src/srsue /configs/ue.conf'
+  ue4:
+    container_name: srsue4
+    image: srsue:split_8_zmq
+    user: root
+    devices:
+    - /dev/net/tun
+    cap_add:
+    - SYS_NICE
+    - SYS_RESOURCE
+    - NET_ADMIN
+    - CAP_IPC_LOCK
+    env_file:
+    - .env
+    volumes:
+    - ./UE/ue_1cu10du_4.conf:/configs/ue.conf
+    - /dev/null:/tmp/ue.log
+    environment:
+    - LD_LIBRARY_PATH=/srsue_4G/lib/src/phy/rf/
+    - PING=${PING}
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.6.1
+    command: bash -c '/srsue_4G/srsue/src/srsue /configs/ue.conf'
+  ue5:
+    container_name: srsue5
+    image: srsue:split_8_zmq
+    user: root
+    devices:
+    - /dev/net/tun
+    cap_add:
+    - SYS_NICE
+    - SYS_RESOURCE
+    - NET_ADMIN
+    - CAP_IPC_LOCK
+    env_file:
+    - .env
+    volumes:
+    - ./UE/ue_1cu10du_5.conf:/configs/ue.conf
+    - /dev/null:/tmp/ue.log
+    environment:
+    - LD_LIBRARY_PATH=/srsue_4G/lib/src/phy/rf/
+    - PING=${PING}
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.7.1
+    command: bash -c '/srsue_4G/srsue/src/srsue /configs/ue.conf'
+  ue6:
+    container_name: srsue6
+    image: srsue:split_8_zmq
+    user: root
+    devices:
+    - /dev/net/tun
+    cap_add:
+    - SYS_NICE
+    - SYS_RESOURCE
+    - NET_ADMIN
+    - CAP_IPC_LOCK
+    env_file:
+    - .env
+    volumes:
+    - ./UE/ue_1cu10du_6.conf:/configs/ue.conf
+    - /dev/null:/tmp/ue.log
+    environment:
+    - LD_LIBRARY_PATH=/srsue_4G/lib/src/phy/rf/
+    - PING=${PING}
+    networks:
+      oran-intel:
+        ipv4_address: 175.53.8.1
+    command: bash -c '/srsue_4G/srsue/src/srsue /configs/ue.conf'
+  metrics-server:
+    container_name: metrics_server
+    image: srsran/metrics_server
+    build:
+      context: RAN/srsRAN_Project/docker/metrics_server
+    environment:
+    - PORT=${METRICS_SERVER_PORT}
+    - BUCKET=${DOCKER_INFLUXDB_INIT_BUCKET}
+    - TESTBED=default
+    - URL=http://${DOCKER_INFLUXDB_INIT_HOST}:${DOCKER_INFLUXDB_INIT_PORT}
+    - ORG=${DOCKER_INFLUXDB_INIT_ORG}
+    - TOKEN=${DOCKER_INFLUXDB_INIT_ADMIN_TOKEN}
+    ports:
+    - 55555:${METRICS_SERVER_PORT}/udp
+    networks:
+      telemetry-net:
+        ipv4_address: 171.40.1.4
+  influxdb:
+    container_name: influxdb
+    image: influxdb:${DOCKER_INFLUXDB_VERSION}
+    volumes:
+    - influxdb-storage:/var/lib/influxdb2:rw
+    env_file:
+    - .env
+    restart: on-failure:10
+    ports:
+    - 8086:${DOCKER_INFLUXDB_INIT_PORT}
+    networks:
+      telemetry-net:
+        ipv4_address: 171.40.1.5
+  grafana:
+    container_name: grafana
+    image: srsran/grafana
+    build:
+      context: RAN/srsRAN_Project/docker/grafana
+    volumes:
+    - grafana-storage:/var/lib/grafana:rw
+    env_file:
+    - .env
+    depends_on:
+    - influxdb
+    - metrics-server
+    ports:
+    - 3300:${GRAFANA_PORT}
+    networks:
+      telemetry-net:
+        ipv4_address: 171.40.1.6
+  redis:
+    image: redis:latest
+    container_name: redis
+    ports:
+    - 6379:6379
+    networks:
+      oran-intel:
+        ipv4_address: 175.24.0.1
+volumes:
+  gnb-storage: null
+  grafana-storage: null
+  influxdb-storage: null
+  prometheus-storage:
+    driver: local
+    driver_opts:
+      type: none
+      device: ./setup/prometheus/
+      o: bind
+networks:
+  oran-intel:
+    external: true
+  telemetry-net:
+    external: true

@@ -1,0 +1,197 @@
+import subprocess
+import time
+import signal
+import sys
+import json
+import os
+
+# Global configuration
+docker_ids = []
+open5gs_id = "open5gs_5gc"
+active_procs = []
+
+# ================= HELPER FUNCTIONS =================
+
+result = subprocess.run("pwd", capture_output=True, text=True)
+pwd = result.stdout.strip()
+print(f'Current working directory is {pwd}')
+
+def get_docker_ids():
+    """Finds all srsue container IDs."""
+    try:
+        cmd = "docker ps --filter 'name=srsue' --format '{{.ID}}'"
+        result = subprocess.check_output(cmd, shell=True, text=True)
+        return result.strip().split('\n') if result.strip() else []
+    except:
+        return []
+
+def force_kill_all_iperf(clients_only=True):
+    """Kill UE-side iperf clients. With clients_only=False, also kill the core's
+    server -- which is almost never what you want, since a missing server means
+    every TCP client fails to connect."""
+    global active_procs
+    for p in active_procs:
+        try:
+            if p.poll() is None:
+                p.terminate()
+                p.wait(timeout=0.2)
+        except: pass
+    active_procs = []
+
+    # Kill iperf CLIENTS in the UEs; leave the core's server alone by default.
+    for cid in get_docker_ids():
+        subprocess.run(f"docker exec {cid} pkill -9 -f 'iperf -c'", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not clients_only:
+        subprocess.run(f"docker exec {open5gs_id} pkill -9 iperf", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def start_iperf_server():
+    """Starts iperf server mode on the Open5GS container."""
+    print(f"Starting iperf server on {open5gs_id}...")
+    # TCP mode: no -u. iperf2 -s accepts multiple concurrent TCP clients (one per UE).
+    subprocess.run(f"docker exec -d {open5gs_id} iperf -s -B 10.45.1.1", shell=True)
+
+def start_uplink_iperf(ue_id, mbps_rate, duration=900):
+    """UE -> Core. Sends TCP traffic at a specific bitrate for `duration` seconds.
+
+    TCP (no -u). iperf 2.1.5 honours -b as an application-level send-rate cap for
+    TCP, so the 25-slot schedule still shapes the offered load; unlike UDP the
+    achieved rate is now closed-loop and will back off under loss/congestion.
+    """
+    target_ip = "10.45.1.1"
+    # iperf 2.1.5 REFUSES -b on TCP when the write buffer -l exceeds roughly one
+    # second of the target rate:
+    #   "ERROR: option -b and -l of 131072 are incompatible, consider setting -l
+    #    to 27525 or lower"
+    # The TCP default is -l 131072, so every client below ~1.05 Mbps died on
+    # startup and no user traffic flowed at all. Size -l from the rate, capped at
+    # the 128K default so high-rate slots behave exactly as before.
+    bytes_per_sec = mbps_rate * 1e6 / 8.0
+    lbuf = max(4096, min(131072, int(bytes_per_sec * 0.9)))
+    cmd = ["docker", "exec", ue_id, "iperf", "-c", target_ip,
+           "-b", f"{mbps_rate}M", "-l", str(lbuf), "-t", str(int(duration))]
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        active_procs.append(p)
+    except Exception as e:
+        print(f"Error starting iperf on {ue_id}: {e}")
+
+def cleanup_and_exit(signum=None, frame=None):
+    print("\n[TrafficGen] Cleaning up and exiting...")
+    force_kill_all_iperf()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, cleanup_and_exit)
+
+# ================= MAIN LOGIC =================
+#
+# Slot-driven daemon. The scrapper owns the traffic rate: at the start of every
+# experiment it writes traffic_slot.json with a new epoch and the rate for that
+# experiment. This process holds that rate for the WHOLE experiment and changes
+# it only when the epoch changes -- i.e. between experiments, never inside a
+# collection window. That is what removes the mid-window traffic steps that
+# contaminated the earlier collections.
+#
+# It also re-establishes the iperf server whenever it goes missing. The scrapper
+# recreates open5gs_5gc (it lives in docker-compose-cu++.yaml) before every
+# experiment, which kills the server; under TCP a missing server means every
+# client fails to connect and no user traffic flows at all.
+
+SLOT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "data_fs_plane", "traffic_slot.json")
+POLL_SEC = 3            # watchdog / slot-file poll interval
+CLIENT_DURATION = 1500  # covers 300s warmup + 600s normal + 300s stress + slack
+
+
+def server_running():
+    r = subprocess.run(f"docker exec {open5gs_id} pgrep -f 'iperf -s'",
+                       shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return r.returncode == 0
+
+
+def ensure_server():
+    """Start the iperf server if it is not there. Returns True if it had to start one."""
+    if not server_running():
+        print("[TrafficGen] iperf server missing in core -- (re)starting", flush=True)
+        start_iperf_server()
+        time.sleep(1)
+        return True
+    return False
+
+
+def read_slot():
+    try:
+        with open(SLOT_FILE) as f:
+            d = json.load(f)
+        return d["epoch"], float(d["mbps_per_ue"]), d.get("label", "")
+    except Exception:
+        return None
+
+
+def running_clients():
+    out = {}
+    for cid in get_docker_ids():
+        r = subprocess.run(f"docker exec {cid} pgrep -f 'iperf -c'",
+                           shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        out[cid] = (r.returncode == 0)
+    return out
+
+
+def arm_all(rate, ids=None):
+    ids = ids if ids is not None else get_docker_ids()
+    for cid in ids:
+        start_uplink_iperf(cid, rate, duration=CLIENT_DURATION)
+    return len(ids)
+
+
+def main():
+    print("[TrafficGen] TCP mode, slot-driven. Waiting for the scrapper to set a slot...", flush=True)
+    ensure_server()
+    cur_epoch = None
+    cur_rate = None
+
+    while True:
+        slot = read_slot()
+
+        if slot is None:
+            ensure_server()          # keep the server warm, send nothing yet
+            time.sleep(POLL_SEC)
+            continue
+
+        epoch, rate, label = slot
+
+        if epoch != cur_epoch:
+            print(f"[TrafficGen] slot {epoch} ({label}): {rate:.2f} Mbps/UE -- re-arming all UEs", flush=True)
+            force_kill_all_iperf()
+            ensure_server()
+            n = arm_all(rate)
+            print(f"[TrafficGen]   {n} TCP clients at {rate:.2f} Mbps each "
+                  f"({rate * n:.2f} Mbps total), held for this whole experiment", flush=True)
+            cur_epoch, cur_rate = epoch, rate
+            time.sleep(POLL_SEC)
+            continue
+
+        # Same experiment: hold the rate. Heal only what died.
+        if ensure_server():
+            print("[TrafficGen]   server was replaced; re-arming clients at the SAME rate", flush=True)
+            force_kill_all_iperf()
+            arm_all(cur_rate)
+        else:
+            for cid, alive in running_clients().items():
+                if not alive:
+                    print(f"[TrafficGen]   UE {cid} client died -- restarting at {cur_rate:.2f} Mbps", flush=True)
+                    start_uplink_iperf(cid, cur_rate, duration=CLIENT_DURATION)
+
+        time.sleep(POLL_SEC)
+
+
+if __name__ == "__main__":
+    while True:
+        try:
+            main()
+        except KeyboardInterrupt:
+            cleanup_and_exit()
+        except Exception as e:
+            print(f"[TrafficGen] error: {e}", flush=True)
+            time.sleep(5)
+
+

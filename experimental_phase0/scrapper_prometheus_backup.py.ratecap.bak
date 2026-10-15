@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""
+O-RAN srsRAN FALCON - Automated Data Collection Pipeline (Isolated Runs Mode)
+=============================================================================
+Performs isolated experiment runs:
+  1. Restarts full stack (Containers + UEs)
+  2. 5-minute setup stabilization phase (NO data collected)
+  3. 10-minute NORMAL baseline collection
+  4. 5-minute STRESS injection collection (CPU / MEM / NET)
+  5. Saves output into dedicated per-fault CSV files: test_<target>_<fault>_rep<N>.csv
+
+Usage:
+    python3 scrapper_prometheus_backup.py [--fault-reps 1]
+"""
+
+import aiohttp
+import asyncio
+import time
+from datetime import datetime
+import logging
+from aiohttp import ClientTimeout
+from typing import Dict, List, Optional
+import pandas as pd
+import csv
+import json
+from influxdb_client.client.influxdb_client_async import InfluxDBClientAsync
+import os
+import random
+import subprocess
+import threading
+import signal
+import sys
+import re
+import argparse
+
+# =====================================================================
+# 1. CONFIGURATION
+# =====================================================================
+parser = argparse.ArgumentParser(description="O-RAN FALCON automated isolated data collection pipeline")
+parser.add_argument("--normal-hours", type=float, default=0.0, help="Unused in isolated mode, kept for compatibility")
+parser.add_argument("--fault-reps", type=int, default=1, help="Number of times to repeat ALL faults on ALL containers (default: 1)")
+parser.add_argument("--anomaly-only", action="store_true", help="Kept for compatibility")
+args = parser.parse_args()
+
+FAULT_REPS = args.fault_reps
+WARMUP_DURATION = 300    # 5 minutes stabilization (No data saved)
+NORMAL_DURATION = 600    # 10 minutes NORMAL data collection
+STRESS_DURATION = 300    # 5 minutes STRESS data collection
+FETCH_INTERVAL = 1.0
+
+# Synchronization & State
+experiment_complete = threading.Event()
+global_stress_data: Dict[str, List[int]] = {}
+stress_lock = threading.Lock()
+
+# Paths
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EXP_DIR = os.path.join(BASE_DIR, "experimental_phase0")
+DATA_DIR = os.path.join(EXP_DIR, "data_fs_plane")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+INPUT_FILE = os.path.join(BASE_DIR, "dataScrapper", "new_allPromQuery.txt")
+PROMETHEUS_URL = "http://localhost:9090"
+influxDB_Token = os.environ.get("INFLUXDB_TOKEN")
+if not influxDB_Token:
+    raise RuntimeError("INFLUXDB_TOKEN env var required. Export it before running this script.")
+org = "srs"
+
+NUM_WORKERS = 50
+TIMEOUT = 10
+RETRY_ATTEMPTS = 3
+
+# Containers
+UE_CONTAINERS = [f"srsue{i}" for i in range(10)]
+rrc_release_flags: Dict[str, bool] = {ue: False for ue in UE_CONTAINERS}
+rrc_lock = threading.Lock()
+
+# TEMP: restricted to CU-only for the CU-NET recollection run. Restore to
+# [f"srscu{i}" for i in range(4)] + [f"srsdu{i}" for i in range(10)] afterward.
+TARGET_CONTAINERS = [f"srscu{i}" for i in range(4)]
+
+log_file = os.path.join(DATA_DIR, "experiment_run.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler()
+    ]
+)
+
+# Global query state
+raw_queries = []
+actual_queries = []
+influx_headers = []
+stress_headers = []
+extra_headers = ["phase", "rrc_release_detected", "any_stress_active"]
+headers = []
+cnames = []
+
+# =====================================================================
+# 2. CORE UTILITIES & STACK RESTART
+# =====================================================================
+def nuclear_cleanup():
+    try:
+        cmd = "docker ps --format '{{.ID}}'"
+        container_ids = subprocess.check_output(cmd, shell=True).decode().splitlines()
+        for cid in container_ids:
+            subprocess.run(f"docker exec {cid} pkill -9 stress-ng", shell=True, stderr=subprocess.DEVNULL)
+            subprocess.run(f"docker exec {cid} tc qdisc del dev eth0 root", shell=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+def signal_handler(sig, frame):
+    logging.info("Received termination signal. Cleaning up...")
+    nuclear_cleanup()
+    experiment_complete.set()
+    sys.exit(0)
+
+def auto_install_offline_dependencies():
+    logging.info("=== AUTOMATED OFFLINE PACKAGE VERIFICATION ===")
+    host_pkg_dir = os.path.join(EXP_DIR, "offline_packages")
+    if not os.path.exists(host_pkg_dir):
+        logging.error(f"[AUTO-INSTALL] Host package directory not found at {host_pkg_dir}!")
+        return False
+
+    for container in TARGET_CONTAINERS:
+        try:
+            check_cmd = f"docker exec {container} which stress-ng"
+            if subprocess.run(check_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                continue
+            logging.warning(f"  {container:8s} -> stress-ng MISSING. Deploying offline assets...")
+            subprocess.run(f"docker exec -u 0 {container} mkdir -p /tmp/pkgs", shell=True, check=True)
+            subprocess.run(f"docker cp {host_pkg_dir}/. {container}:/tmp/pkgs/", shell=True, check=True)
+            subprocess.run(f"docker exec -u 0 {container} dpkg -iR /tmp/pkgs/", shell=True, capture_output=True, text=True)
+            subprocess.run(f"docker exec -u 0 {container} rm -rf /tmp/pkgs", shell=True, check=True)
+        except Exception as e:
+            logging.error(f"  {container:8s} -> Auto-install failure: {e}")
+    logging.info("=== END OFFLINE PACKAGE VERIFICATION ===")
+
+def get_container_full_id(container_name: str) -> Optional[str]:
+    try:
+        return subprocess.check_output(
+            f"docker inspect --format '{{{{.Id}}}}' {container_name}",
+            shell=True, stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return None
+
+def get_container_name(container_id: str) -> Optional[str]:
+    try:
+        return subprocess.check_output(
+            f"docker inspect --format '{{{{.Name}}}}' {container_id}",
+            shell=True, stderr=subprocess.DEVNULL
+        ).decode().strip().lstrip('/')
+    except Exception:
+        return None
+
+def fix_queries_with_ids(queries: List[str]) -> List[str]:
+    fixed_queries = []
+    name_pattern = re.compile(r'name="([^"]+)"')
+    for q in queries:
+        match = name_pattern.search(q)
+        if match:
+            cname = match.group(1)
+            cid = get_container_full_id(cname)
+            if cid and cname not in ['cadvisor', 'node-exporter', 'prometheus', 'open5gs_5gc']:
+                fixed_queries.append(q.replace(f'name="{cname}"', f'id=~".*{cid}.*"'))
+            else:
+                fixed_queries.append(q)
+        else:
+            fixed_queries.append(q)
+    return fixed_queries
+
+def restart_full_stack():
+    """Tears down all containers and brings them back up cleanly for isolated test runs."""
+    logging.info("=====================================================================")
+    logging.info("[STACK RESTART] Performing full network topology reset...")
+    logging.info("=====================================================================")
+    try:
+        nuclear_cleanup()
+        subprocess.run(f"docker compose -f {BASE_DIR}/docker-compose-ue++.yaml down", shell=True, check=False)
+        subprocess.run("docker exec open5gs_5gc pkill -9 iperf", shell=True, check=False)
+        subprocess.run(f"docker compose -f {BASE_DIR}/docker-compose-du.yaml down", shell=True, check=False)
+        subprocess.run(f"docker compose -f {BASE_DIR}/docker-compose-cu++.yaml down", shell=True, check=False)
+        time.sleep(5)
+
+        logging.info("[STACK RESTART] Booting CU Layer...")
+        subprocess.run(f"docker compose -f {BASE_DIR}/docker-compose-cu++.yaml up -d", shell=True, check=True)
+        time.sleep(5)
+
+        logging.info("[STACK RESTART] Booting DU Layer...")
+        subprocess.run(f"docker compose -f {BASE_DIR}/docker-compose-du.yaml up -d", shell=True, check=True)
+        time.sleep(10)
+
+        auto_install_offline_dependencies()
+
+        logging.info("[STACK RESTART] Booting UE Layer...")
+        subprocess.run(f"docker compose -f {BASE_DIR}/docker-compose-ue++.yaml up -d", shell=True, check=True)
+        time.sleep(15)
+
+        # Update Docker ID mappings for Prometheus
+        global actual_queries
+        actual_queries = fix_queries_with_ids(raw_queries)
+
+        # Reset stress state
+        with stress_lock:
+            for c in cnames:
+                global_stress_data[c] = [0, 0]
+
+        # Reset RRC flags
+        with rrc_lock:
+            for ue in UE_CONTAINERS:
+                rrc_release_flags[ue] = False
+
+        logging.info("[STACK RESTART] Stack recovery completed successfully.")
+    except Exception as e:
+        logging.error(f"[STACK RESTART] Critical failure during stack reset: {e}")
+
+# =====================================================================
+# 3. RRC MONITORING
+# =====================================================================
+def check_rrc_release_once() -> Dict[str, bool]:
+    results = {}
+    for ue in UE_CONTAINERS:
+        try:
+            logs = subprocess.check_output(["docker", "logs", "--tail", "100", ue], text=True, stderr=subprocess.DEVNULL)
+            found = "Received RRC Release" in logs
+            results[ue] = found
+            if found:
+                with rrc_lock:
+                    if not rrc_release_flags[ue]:
+                        rrc_release_flags[ue] = True
+                        logging.warning(f"RRC RELEASE detected in {ue}!")
+        except Exception:
+            results[ue] = False
+    return results
+
+# =====================================================================
+# 4. TELEMETRY CLIENTS
+# =====================================================================
+class PrometheusClient:
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+        self.timeout = ClientTimeout(total=TIMEOUT)
+        self.session = None
+
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(timeout=self.timeout, connector=aiohttp.TCPConnector(limit=NUM_WORKERS))
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+
+    async def fetch_query(self, query: str) -> Optional[float]:
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                async with self.session.get(f"{self.base_url}/api/v1/query", params={"query": query}) as response:
+                    result = await response.json()
+                    if result.get('status') == 'success' and result.get('data', {}).get('result'):
+                        return float(result['data']['result'][0]['value'][1])
+                    return 0.0
+            except Exception:
+                if attempt == RETRY_ATTEMPTS - 1:
+                    return 0.0
+                await asyncio.sleep(0.1)
+
+async def fetch_influx_data() -> pd.DataFrame:
+    data = {}
+    try:
+        async with InfluxDBClientAsync(url="http://localhost:8086", token=influxDB_Token, org=org) as client:
+            query_api = client.query_api()
+            flux_query = (
+                f'from(bucket: "srsran") |> range(start: -30s) '
+                f'|> filter(fn: (r) => r["_measurement"] == "ue_info") '
+                f'|> filter(fn: (r) => r["rnti"] == "4601") '
+                f'|> last() '
+                f'|> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")'
+            )
+            tables = await query_api.query(flux_query)
+            for table in tables:
+                for record in table.records:
+                    pci = record.values.get("pci")
+                    for field, value in record.values.items():
+                        if field in ['_start', '_stop', '_time', '_measurement', 'rnti', 'pci', 'testbed', 'result', 'table']:
+                            continue
+                        key = f"PCI-{pci}_RNTI-4601_{field}"
+                        try:
+                            data[key] = float(value) if value is not None and value != 'n/a' else 0.0
+                        except (ValueError, TypeError):
+                            data[key] = 0.0
+    except Exception:
+        pass
+    return pd.DataFrame([data])
+
+# =====================================================================
+# 5. STRESS ENGINE
+# =====================================================================
+def injectStress(container_id: str, typeOfStress: int, duration: int):
+    cname = get_container_name(container_id) or container_id
+    intensity = random.randint(85, 95)
+    net_applied = False
+
+    try:
+        if typeOfStress == 1:  # CPU
+            cmd = f"docker exec {container_id} stress-ng --cpu 4 --cpu-load {intensity} --timeout {duration}s"
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with stress_lock:
+                global_stress_data[cname] = [typeOfStress, intensity]
+            proc.wait()
+
+        elif typeOfStress == 2:  # MEM
+            mb = int((intensity / 100.0) * 512)
+            cmd = f"docker exec {container_id} stress-ng --vm 1 --vm-bytes {mb}M --timeout {duration}s"
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with stress_lock:
+                global_stress_data[cname] = [typeOfStress, intensity]
+            proc.wait()
+
+        elif typeOfStress == 3:  # NET
+            # Measure this container's OWN current tx rate over a 10s window,
+            # so the cap is relative to its actual baseline instead of one
+            # fixed value (which would be a no-op for a high-traffic CU and
+            # far too aggressive for a low-traffic one). A 2s window was
+            # tried first but is too short for CUs with several simultaneous
+            # UEs (cu2, cu3) — a brief burst or lull in that short a sample
+            # can miscalibrate the cap (too high = no-op, too low = starves
+            # the connection, which is what caused the RRC Releases at the
+            # 50% setting). 10s averages over more traffic variation before
+            # computing the cap.
+            b0 = int(subprocess.check_output(
+                f"docker exec {container_id} cat /sys/class/net/eth0/statistics/tx_bytes",
+                shell=True))
+            time.sleep(10)
+            b1 = int(subprocess.check_output(
+                f"docker exec {container_id} cat /sys/class/net/eth0/statistics/tx_bytes",
+                shell=True))
+            baseline_bps = max((b1 - b0) / 10.0, 1.0)
+
+            # Fixed 20% cut (keep 80% of baseline) — a 50% cut was also
+            # smoke-tested and gave a stronger signal, but caused a real RRC
+            # Release on cu2 (srsue3/4/5) and cu3 (srsue6/7/8/9) during a full
+            # 5-minute run, back when baseline was measured over just 2s
+            # (too short for CUs with several simultaneous UEs, causing an
+            # occasional badly miscalibrated cap). Now that baseline uses the
+            # wider 10s window above, 50% could be worth re-validating live
+            # again before using it in a real collection — for now 20% is
+            # the confirmed-safe value on all 4 CUs. `intensity` is still
+            # recorded for logging/labeling consistency with CPU/MEM, but
+            # does not scale the NET cut.
+            keep_frac = 0.8
+            cap_kbit = max(1, int(baseline_bps * 8 / 1000 * keep_frac))
+
+            cmd = f"docker exec {container_id} tc qdisc replace dev eth0 root netem rate {cap_kbit}kbit"
+            subprocess.run(cmd, shell=True, stderr=subprocess.DEVNULL)
+            net_applied = True
+            with stress_lock:
+                global_stress_data[cname] = [typeOfStress, intensity]
+            time.sleep(duration)
+
+    except Exception as e:
+        logging.error(f"Stress injection failed on {cname}: {e}")
+    finally:
+        if typeOfStress == 3 and net_applied:
+            subprocess.run(f"docker exec {container_id} tc qdisc del dev eth0 root", shell=True, stderr=subprocess.DEVNULL)
+        with stress_lock:
+            global_stress_data[cname] = [0, 0]
+
+# =====================================================================
+# 6. DATA COLLECTION ENGINE
+# =====================================================================
+async def collect_data_for_duration(duration_sec: int, output_file: str, phase_label: str):
+    """Logs metrics continuously for a specific duration directly to target output_file."""
+    start_time = time.time()
+    async with PrometheusClient(PROMETHEUS_URL) as client:
+        while (time.time() - start_time) < duration_sec and not experiment_complete.is_set():
+            loop_start = time.time()
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+            # Parallel Fetch
+            prom_task = asyncio.gather(*[client.fetch_query(aq) for aq in actual_queries])
+            influx_task = fetch_influx_data()
+            prom_results, current_influx_df = await asyncio.gather(prom_task, influx_task)
+
+            # Map Row
+            row = {"Timestamp": ts}
+            row.update(dict(zip(raw_queries, prom_results)))
+
+            influx_vals = current_influx_df.iloc[0].to_dict() if not current_influx_df.empty else {}
+            for h in influx_headers:
+                row[h] = influx_vals.get(h, 0.0)
+
+            with stress_lock:
+                sc = global_stress_data.copy()
+            for c in cnames:
+                row[f"{c}_stressType"], row[f"{c}_stepStress"] = sc.get(c, [0, 0])
+
+            any_stress = any(v[0] != 0 for v in sc.values())
+
+            # Check RRC status
+            check_rrc_release_once()
+            with rrc_lock:
+                any_rrc = any(rrc_release_flags.values())
+
+            row["phase"] = phase_label
+            row["rrc_release_detected"] = 1 if any_rrc else 0
+            row["any_stress_active"] = 1 if any_stress else 0
+
+            filtered_row = {k: row[k] for k in headers if k in row}
+            with open(output_file, "a", newline="") as f:
+                csv.DictWriter(f, fieldnames=headers, extrasaction='ignore').writerow(filtered_row)
+
+            elapsed = time.time() - loop_start
+            await asyncio.sleep(max(0, FETCH_INTERVAL - elapsed))
+
+def run_isolated_experiment(victim_name: str, stress_type: int, rep: int):
+    """Executes the 15-minute isolated experiment sequence:
+      - 5 min setup/warmup (NO DATA SAVED)
+      - 10 min NORMAL collection (Saved to CSV)
+      - 5 min STRESS collection (Saved to CSV)
+    """
+    stress_names = {1: "CPU", 2: "MEM", 3: "NET"}
+    s_name = stress_names[stress_type]
+
+    # Per-experiment CSV Output File
+    csv_filename = os.path.join(DATA_DIR, f"test_{victim_name}_{s_name}_rep{rep}.csv")
+
+    logging.info(f"=== EXPERIMENT START: Entity={victim_name} | Fault={s_name} | Rep={rep} ===")
+    logging.info(f"Target Output: {csv_filename}")
+
+    # Write CSV Header
+    with open(csv_filename, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=headers).writeheader()
+
+    # 1. Setup / Warmup Phase (5 Minutes - NO DATA LOGGING)
+    logging.info(f"[Phase 1/3] Waiting {WARMUP_DURATION}s for setup to stabilize (NO data collection)...")
+    time.sleep(WARMUP_DURATION)
+
+    # 2. Normal Data Collection (10 Minutes)
+    logging.info(f"[Phase 2/3] Collecting {NORMAL_DURATION}s of NORMAL baseline data...")
+    asyncio.run(collect_data_for_duration(NORMAL_DURATION, csv_filename, phase_label="NORMAL"))
+
+    # 3. Stress Data Collection (5 Minutes)
+    victim_id = get_container_full_id(victim_name)
+    if not victim_id:
+        logging.error(f"Target container {victim_name} not found! Skipping stress injection.")
+        return
+
+    logging.info(f"[Phase 3/3] Injecting {s_name} stress on {victim_name} for {STRESS_DURATION}s...")
+
+    # Run stress in background while main thread logs metrics
+    stress_thread = threading.Thread(target=injectStress, args=(victim_id, stress_type, STRESS_DURATION))
+    stress_thread.start()
+
+    asyncio.run(collect_data_for_duration(STRESS_DURATION, csv_filename, phase_label="ANOMALY"))
+    stress_thread.join()
+
+    logging.info(f"=== EXPERIMENT COMPLETE: Saved to {csv_filename} ===\n")
+
+# =====================================================================
+# 7. MAIN ORCHESTRATOR
+# =====================================================================
+async def setup_schema():
+    global raw_queries, actual_queries, influx_headers, stress_headers, headers, cnames
+
+    with open(INPUT_FILE, "r") as f:
+        raw_queries = [line.strip() for line in f.readlines() if line.strip()]
+    actual_queries = fix_queries_with_ids(raw_queries)
+
+    init_df = await fetch_influx_data()
+    influx_headers = sorted(list(init_df.columns))
+
+    cnames = sorted(subprocess.check_output(
+        "docker ps --filter 'name=^srscu' --filter 'name=^srsdu' --format '{{.Names}}'",
+        shell=True
+    ).decode().splitlines())
+
+    stress_headers = []
+    for c in cnames:
+        stress_headers.extend([f"{c}_stressType", f"{c}_stepStress"])
+        global_stress_data[c] = [0, 0]
+
+    headers = ["Timestamp"] + raw_queries + influx_headers + stress_headers + extra_headers
+
+def main_execution_loop():
+    stress_names = {1: "CPU", 2: "MEM", 3: "NET"}
+    # TEMP: NET-only for the CU-NET recollection run. Restore to [1, 2, 3] afterward.
+    STRESS_TYPES_THIS_RUN = [3]
+    total_experiments = len(TARGET_CONTAINERS) * len(STRESS_TYPES_THIS_RUN) * FAULT_REPS
+    exp_count = 0
+
+    for rep in range(1, FAULT_REPS + 1):
+        for victim_name in TARGET_CONTAINERS:
+            for s_type in STRESS_TYPES_THIS_RUN:
+                exp_count += 1
+                logging.info(f"Progress: [{exp_count}/{total_experiments}] Target={victim_name} Stress={stress_names[s_type]}")
+
+                # Step 1: Clean restart of stack before every run
+                restart_full_stack()
+
+                # Step 2: Run 15-minute sequence (5m warmup + 10m normal + 5m stress)
+                run_isolated_experiment(victim_name, s_type, rep)
+
+    logging.info("=====================================================================")
+    logging.info("ALL ISOLATED EXPERIMENTS COMPLETED SUCCESSFULLY.")
+    logging.info("=====================================================================")
+    experiment_complete.set()
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    auto_install_offline_dependencies()
+    asyncio.run(setup_schema())
+
+    # Execute main workload loop
+    main_execution_loop()
+
+
+
